@@ -1,0 +1,42 @@
+# 本地开发配置模板：复制成 application-dev.yml 后填入真实的本地凭据。
+# application-dev.yml 已被 .gitignore 忽略（内含本地口令，不进仓库），所以仓库里只留这份模板。
+#   copy cloud-storage-web\src\main\resources\application-dev.yml.example ..\application-dev.yml
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    url: jdbc:mysql://localhost:3306/cloud_storage?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai&useSSL=false&allowPublicKeyRetrieval=true&rewriteBatchedStatements=true
+    username: root
+    password: "REPLACE_WITH_LOCAL_MYSQL_PASSWORD"
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 10000
+      pool-name: cloud-storage-pool
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password: "REPLACE_WITH_LOCAL_REDIS_PASSWORD"
+      # 专用库索引：db0 属于其它项目，本项目只用 db1
+      database: 1
+      timeout: 3000ms
+      lettuce:
+        pool:
+          max-active: 16
+          max-idle: 8
+          min-idle: 0
+          max-wait: 2000ms
+
+app:
+  storage:
+    # 也可以改用环境变量 MINIO_ACCESS_KEY / MINIO_SECRET_KEY（application.yml 已留占位）
+    minio:
+      access-key: REPLACE_WITH_MINIO_ACCESS_KEY
+      secret-key: REPLACE_WITH_MINIO_SECRET_KEY
+  redis:
+    enabled: true
+  mq:
+    # 开发环境把重试节奏调快，方便手工验证"重试 → 死信 → 重放"
+    max-retry: 2
+    retry-backoff: 3s
+    reconcile-interval: 5s

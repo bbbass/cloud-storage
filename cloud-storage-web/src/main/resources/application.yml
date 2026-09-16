@@ -1,0 +1,101 @@
+server:
+  port: 8080
+  servlet:
+    encoding:
+      charset: UTF-8
+      force: true
+
+spring:
+  application:
+    name: cloud-storage
+  profiles:
+    active: dev
+  servlet:
+    multipart:
+      max-file-size: 5GB
+      max-request-size: 5GB
+  jackson:
+    date-format: yyyy-MM-dd'T'HH:mm:ss
+    time-zone: Asia/Shanghai
+    default-property-inclusion: non_null
+
+mybatis-plus:
+  mapper-locations: classpath*:/mapper/**/*.xml
+  type-aliases-package: com.cloudstorage.domain.entity
+  configuration:
+    map-underscore-to-camel-case: true
+  global-config:
+    banner: false
+    db-config:
+      id-type: assign_id
+      logic-delete-field: deleted
+      logic-delete-value: 1
+      logic-not-delete-value: 0
+
+# 外部依赖开关：见 AGENTS.md 7.5，中间件在 WSL 里，未启动时走单机兜底
+app:
+  storage:
+    # 真实链路默认走 MinIO；离线开发可临时切 local（--app.storage.type=local）
+    type: minio
+    local-path: ./data/storage
+    minio:
+      endpoint: http://localhost:9000
+      # 凭据不写进仓库：本地真实值放 application-dev.yml（已 gitignore），
+      # 模板见 application-dev.yml.example，也可用环境变量覆盖。
+      access-key: ${MINIO_ACCESS_KEY:}
+      secret-key: ${MINIO_SECRET_KEY:}
+      bucket: cloud-storage
+  upload:
+    # 默认 5MiB：MinIO/S3 服务端 compose 要求除最后一片外每片 ≥ 5MiB
+    default-chunk-size: 5242880
+    min-chunk-size: 5242880
+    max-chunk-size: 67108864
+    max-chunk-total: 10000
+    verify-after-merge: true
+    session-ttl: 24h
+  auth:
+    # M1 临时身份方案（M4 换成 JWT），见 DevAuthInterceptor
+    dev-default-user-id: 1
+  limiter:
+    # 自研滑动窗口限流（Redis ZSET + Lua），阈值可按场景覆盖
+    enabled: true
+    key-prefix: cs:rl
+    scenes:
+      upload-init:
+        user-limit: 60
+        device-limit: 20
+        window: 1m
+      upload-part:
+        user-limit: 1200
+        device-limit: 300
+        window: 1m
+      upload-complete:
+        user-limit: 60
+        device-limit: 20
+        window: 1m
+  quota:
+    # 默认每用户 1 GiB
+    default-quota-bytes: 1073741824
+    key-prefix: cs:quota
+  mq:
+    # true = 走真实 RocketMQ；false = 进程内线程池兜底（仅调试）
+    enabled: true
+    name-server: localhost:9876
+    producer-group: cloud-storage-producer
+    consumer-group: cloud-storage-consumer
+    topic: cloud-storage-processing
+    tag: processing
+    max-retry: 3
+    retry-backoff: 5s
+    consume-thread-min: 2
+    consume-thread-max: 8
+    reconcile-interval: 30s
+    stuck-running-timeout: 5m
+  redis:
+    # 开发环境在 application-dev.yml 里打开（WSL 上的 Redis，数据库 1）
+    enabled: false
+
+logging:
+  level:
+    root: info
+    com.cloudstorage: debug

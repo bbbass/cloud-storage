@@ -1,0 +1,39 @@
+target/
+!.mvn/wrapper/maven-wrapper.jar
+
+### IDE ###
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+### 前端 ###
+node_modules/
+dist/
+cloud-storage-frontend/.vite/
+
+### 运行产物 ###
+data/
+logs/
+*.log
+
+### 本地敏感配置 ###
+*.local
+.env
+.env.*
+application-dev.yml
+application-local.yml
+application-prod.yml
+*.pem
+*.key
+*.p12
+*.jks
+id_rsa*
+id_ed25519*
+
+### 内部文档 ###
+AGENTS.md
