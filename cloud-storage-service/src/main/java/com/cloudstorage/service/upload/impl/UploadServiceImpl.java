@@ -108,7 +108,9 @@ public class UploadServiceImpl implements UploadService {
                 item = transactionTemplate.execute(status -> {
                     // 关键：秒传也要加引用计数，否则多个文件条目指向同一份物理数据时，
                     // 删除其中一个会让计数归零，把仍被引用的对象删掉。
-                    fileObjectMapper.incrementRef(reused.getId());
+                    if (fileObjectMapper.incrementRef(reused.getId()) != 1) {
+                        throw new BusinessException(ErrorCode.STORAGE_ERROR, "物理对象已失效，请重试");
+                    }
                     FileItem created = createFileItem(userId, reused, fileName, parentId, command.getContentType());
                     quotaService.commit(userId, fileSize);
                     return created;
@@ -150,7 +152,8 @@ public class UploadServiceImpl implements UploadService {
             try {
                 sessionMapper.insert(session);
             } catch (RuntimeException e) {
-                quotaService.release(userId, fileSize);
+                // session 可能已经拿到雪花 id；有 id 就走幂等释放，避免异常重试重复扣。
+                quotaService.releaseOnce(session.getId(), userId, fileSize);
                 throw e;
             }
             log.info("创建上传会话：uploadId={}, fileName={}, size={}, chunkTotal={}",
@@ -290,58 +293,19 @@ public class UploadServiceImpl implements UploadService {
             String actual = sha256OfObject(finalKey);
             if (!actual.equalsIgnoreCase(session.getSha256())) {
                 storageService.delete(finalKey);
-                sessionMapper.updateStatus(uploadId, UploadStatus.FAILED.name());
+                failMergingSession(session);
                 throw new BusinessException(ErrorCode.UPLOAD_HASH_MISMATCH);
             }
         }
 
-        CompleteUploadResult result = transactionTemplate.execute(status -> {
-            FileObject object = findReadyObject(session.getSha256(), session.getFileSize());
-            boolean deduped = object != null;
-            if (object == null) {
-                object = new FileObject();
-                object.setBucket(null);
-                object.setObjectKey(finalKey);
-                object.setStorageType(storageService.type());
-                object.setSha256(session.getSha256());
-                object.setSize(session.getFileSize());
-                object.setContentType(session.getContentType());
-                object.setRefCount(0);
-                object.setStatus(STATUS_READY);
-                try {
-                    fileObjectMapper.insert(object);
-                } catch (DuplicateKeyException e) {
-                    // 并发下另一个请求先登记了同一份内容，改为复用
-                    object = findReadyObject(session.getSha256(), session.getFileSize());
-                    deduped = true;
-                }
+        CompleteUploadResult result = registerMergingSession(uploadId, start);
+        if (result == null) {
+            UploadSession latest = requireOwnedSession(userId, uploadId);
+            if (UploadStatus.DONE.name().equals(latest.getStatus())) {
+                return doneResult(latest, start, true);
             }
-            if (object == null) {
-                throw new BusinessException(ErrorCode.STORAGE_ERROR, "物理对象登记失败");
-            }
-            fileObjectMapper.incrementRef(object.getId());
-
-            FileItem item = createFileItem(userId, object, session.getFileName(), session.getParentId(),
-                    session.getContentType());
-            // DB 是配额的事实源：预占在 init 时已经做过，这里只把用量落到 DB
-            quotaService.commit(userId, session.getFileSize());
-            sessionMapper.markDone(uploadId, object.getId(), item == null ? null : item.getId());
-
-            // 合并完成后分片对象不再需要，顺手清掉（失败不影响主流程）
-            sources.forEach(storageService::delete);
-            partMapper.hardDeleteByUploadId(uploadId);
-            progressBus.clear(uploadId);
-
-            return CompleteUploadResult.builder()
-                    .uploadId(uploadId)
-                    .fileId(item == null ? null : item.getId())
-                    .objectId(object.getId())
-                    .sha256(session.getSha256())
-                    .size(session.getFileSize())
-                    .deduped(deduped)
-                    .costMs(System.currentTimeMillis() - start)
-                    .build();
-        });
+            throw new BusinessException(ErrorCode.UPLOAD_MERGING);
+        }
 
         publish(uploadId, UploadStatus.DONE.name(), session.getChunkTotal(), session.getChunkTotal(), 100, "合并完成");
         // 事务已提交，再登记并投递异步任务（本地消息表模式：先落库、后投递，投递失败由补偿任务兜底）
@@ -362,11 +326,19 @@ public class UploadServiceImpl implements UploadService {
         if (UploadStatus.DONE.name().equals(session.getStatus())) {
             throw new BusinessException(ErrorCode.UPLOAD_STATUS_INVALID, "已完成的上传不能中止");
         }
-        partMapper.selectPartNos(uploadId).forEach(no -> storageService.delete(stagingKey(uploadId, no)));
-        partMapper.hardDeleteByUploadId(uploadId);
+        if (UploadStatus.MERGING.name().equals(session.getStatus())) {
+            throw new BusinessException(ErrorCode.UPLOAD_MERGING);
+        }
+        if (!UploadStatus.isActive(session.getStatus())) {
+            // EXPIRED / FAILED 说明资源已经由中止、失败处理或清理任务接管。
+            // 重复 DELETE 直接幂等返回，绝不能再释放一次配额。
+            log.info("上传会话已终态，忽略重复中止：uploadId={}, status={}", uploadId, session.getStatus());
+            return;
+        }
+        // 先释放再清理：如果清理中途失败，会话仍停留在 active，下一轮清理任务会幂等重试。
+        quotaService.releaseOnce(uploadId, userId, session.getFileSize());
+        cleanupStaging(session);
         sessionMapper.updateStatus(uploadId, UploadStatus.EXPIRED.name());
-        // 回滚预占，否则用户"传了又取消"会白白占着配额
-        quotaService.release(userId, session.getFileSize());
         progressBus.publish(UploadProgress.builder()
                 .uploadId(uploadId)
                 .status(UploadStatus.EXPIRED.name())
@@ -377,6 +349,46 @@ public class UploadServiceImpl implements UploadService {
                 .timestamp(System.currentTimeMillis())
                 .build());
         log.info("上传已中止：uploadId={}", uploadId);
+    }
+
+    @Override
+    public void recoverMerging(Long uploadId) {
+        UploadSession session = sessionMapper.selectById(uploadId);
+        if (session == null || !UploadStatus.MERGING.name().equals(session.getStatus())) {
+            return;
+        }
+
+        String finalKey = objectKey(session.getSha256());
+        if (!storageService.exists(finalKey)) {
+            // compose 没留下可登记的最终对象：把状态回退，让客户端在分片仍在时重试 complete。
+            LocalDateTime deadline = LocalDateTime.now().minus(uploadProperties.getMergingTimeout());
+            int reset = sessionMapper.resetStuckMerging(uploadId, deadline,
+                    LocalDateTime.now().plus(uploadProperties.getSessionTtl()));
+            if (reset == 1) {
+                log.warn("MERGING 超时且最终对象不存在，已回退 UPLOADING：uploadId={}", uploadId);
+            }
+            return;
+        }
+
+        // 卡死恢复同样要校验内容：finalKey 存在不代表上一次 compose 的字节正确。
+        if (uploadProperties.isVerifyAfterMerge()) {
+            String actual = sha256OfObject(finalKey);
+            if (!actual.equalsIgnoreCase(session.getSha256())) {
+                storageService.delete(finalKey);
+                failMergingSession(session);
+                return;
+            }
+        }
+
+        CompleteUploadResult result = registerMergingSession(uploadId, System.currentTimeMillis());
+        if (result == null) {
+            return;
+        }
+        publish(uploadId, UploadStatus.DONE.name(), session.getChunkTotal(), session.getChunkTotal(), 100, "合并恢复完成");
+        processingTaskService.enqueueForFile(session.getUserId(), result.getFileId(), result.getObjectId(),
+                session.getContentType());
+        log.info("MERGING 会话恢复完成：uploadId={}, fileId={}, objectId={}",
+                uploadId, result.getFileId(), result.getObjectId());
     }
 
     @Override
@@ -413,6 +425,116 @@ public class UploadServiceImpl implements UploadService {
             throw new BusinessException(ErrorCode.FORBIDDEN, "无权操作该上传会话");
         }
         return session;
+    }
+
+    /**
+     * 把已经 compose 成功、内容校验通过的会话登记成 DONE。
+     * 正常 complete 和 MERGING 恢复都走这里，靠行锁 + 状态 CAS 保证只登记一次。
+     */
+    private CompleteUploadResult registerMergingSession(Long uploadId, long start) {
+        return transactionTemplate.execute(status -> {
+            UploadSession session = sessionMapper.selectByIdForUpdate(uploadId);
+            if (session == null) {
+                throw new BusinessException(ErrorCode.UPLOAD_SESSION_NOT_FOUND);
+            }
+            if (UploadStatus.DONE.name().equals(session.getStatus())) {
+                return null;
+            }
+            if (!UploadStatus.MERGING.name().equals(session.getStatus())) {
+                // 恢复任务可能把长时间无进展的 MERGING 回退成 UPLOADING；
+                // 当前请求已经 compose 出对象，可以重新抢一次合并权继续登记。
+                if (!UploadStatus.isActive(session.getStatus())
+                        || sessionMapper.casMarkMerging(uploadId, session.getUserId()) != 1) {
+                    throw new BusinessException(ErrorCode.UPLOAD_STATUS_INVALID,
+                            "会话状态：" + session.getStatus());
+                }
+                session = sessionMapper.selectByIdForUpdate(uploadId);
+                if (session == null) {
+                    throw new BusinessException(ErrorCode.UPLOAD_SESSION_NOT_FOUND);
+                }
+            }
+
+            FileObject object = findReadyObject(session.getSha256(), session.getFileSize());
+            boolean deduped = object != null;
+            if (object == null) {
+                object = new FileObject();
+                object.setBucket(null);
+                object.setObjectKey(objectKey(session.getSha256()));
+                object.setStorageType(storageService.type());
+                object.setSha256(session.getSha256());
+                object.setSize(session.getFileSize());
+                object.setContentType(session.getContentType());
+                object.setRefCount(0);
+                object.setStatus(STATUS_READY);
+                try {
+                    fileObjectMapper.insert(object);
+                } catch (DuplicateKeyException e) {
+                    // 并发下另一个请求先登记了同一份内容，改为复用
+                    object = findReadyObject(session.getSha256(), session.getFileSize());
+                    deduped = true;
+                }
+            }
+            if (object == null) {
+                throw new BusinessException(ErrorCode.STORAGE_ERROR, "物理对象登记失败");
+            }
+            if (fileObjectMapper.incrementRef(object.getId()) != 1) {
+                // 删除并发把对象物理删掉时，引用计数不能落空；让客户端/恢复任务重试。
+                throw new BusinessException(ErrorCode.STORAGE_ERROR, "物理对象已失效，请重试");
+            }
+
+            FileItem item = createFileItem(session.getUserId(), object, session.getFileName(),
+                    session.getParentId(), session.getContentType());
+            // DB 是配额的事实源：预占在 init 时已经做过，这里只把用量落到 DB
+            quotaService.commit(session.getUserId(), session.getFileSize());
+            if (sessionMapper.markDone(uploadId, object.getId(), item == null ? null : item.getId()) != 1) {
+                throw new BusinessException(ErrorCode.UPLOAD_MERGING);
+            }
+
+            cleanupStaging(session);
+            progressBus.clear(uploadId);
+
+            return CompleteUploadResult.builder()
+                    .uploadId(uploadId)
+                    .fileId(item == null ? null : item.getId())
+                    .objectId(object.getId())
+                    .sha256(session.getSha256())
+                    .size(session.getFileSize())
+                    .deduped(deduped)
+                    .costMs(System.currentTimeMillis() - start)
+                    .build();
+        });
+    }
+
+    /**
+     * 合并失败后的统一收尾：状态先置 FAILED，再释放配额、删 staging。
+     * 任一步失败都保留分片记录，交给 UploadSessionCleaner 的 FAILED 候选继续幂等重试。
+     */
+    private void failMergingSession(UploadSession session) {
+        if (sessionMapper.markFailedIfMerging(session.getId()) != 1) {
+            log.warn("合并失败会话状态未更新，跳过收尾：uploadId={}, status={}",
+                    session.getId(), session.getStatus());
+            return;
+        }
+        try {
+            quotaService.releaseOnce(session.getId(), session.getUserId(), session.getFileSize());
+        } catch (Exception e) {
+            // 先释放再删分片：Redis 失败时保留 upload_parts，让清理任务以后还能捞到它重试。
+            log.warn("FAILED 会话释放配额失败，等待清理任务重试：uploadId={}", session.getId(), e);
+            return;
+        }
+        try {
+            cleanupStaging(session);
+        } catch (Exception e) {
+            log.warn("FAILED 会话清理分片失败，等待清理任务重试：uploadId={}", session.getId(), e);
+        }
+        publish(session.getId(), UploadStatus.FAILED.name(), 0, session.getChunkTotal(), 0, "合并校验失败");
+    }
+
+    /** 删除 staging 对象和分片登记；所有调用点都必须容忍重复执行 */
+    private void cleanupStaging(UploadSession session) {
+        partMapper.selectPartNos(session.getId())
+                .forEach(no -> storageService.delete(stagingKey(session.getId(), no)));
+        partMapper.hardDeleteByUploadId(session.getId());
     }
 
     private FileObject findReadyObject(String sha256, Long size) {

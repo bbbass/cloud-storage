@@ -16,6 +16,8 @@ import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -48,6 +50,28 @@ public class QuotaServiceImpl implements QuotaService {
             """;
 
     private static final DefaultRedisScript<List> RESERVE = new DefaultRedisScript<>(RESERVE_SCRIPT, List.class);
+
+    /**
+     * 释放必须幂等：abort 重试、FAILED 清理、MERGING 恢复可能同时到达。
+     * SET NX 标记和扣减放在同一个 Lua 里，避免"标记成功但扣减失败"。
+     */
+    private static final String RELEASE_ONCE_SCRIPT = """
+            local released = redis.call('SET', KEYS[2], '1', 'NX', 'EX', ARGV[2])
+            if not released then
+                return {0, tonumber(redis.call('GET', KEYS[1]) or '0')}
+            end
+            local used = tonumber(redis.call('GET', KEYS[1]) or '0')
+            local size = tonumber(ARGV[1])
+            local nextUsed = used - size
+            if nextUsed < 0 then
+                nextUsed = 0
+            end
+            redis.call('SET', KEYS[1], nextUsed)
+            return {1, nextUsed}
+            """;
+
+    private static final DefaultRedisScript<List> RELEASE_ONCE =
+            new DefaultRedisScript<>(RELEASE_ONCE_SCRIPT, List.class);
 
     private final QuotaUsageMapper quotaUsageMapper;
     private final UploadSessionMapper uploadSessionMapper;
@@ -104,6 +128,32 @@ public class QuotaServiceImpl implements QuotaService {
             // 预占被重复释放或 Redis 数据丢失：兜底归零，等对账修正
             redisTemplate.opsForValue().set(usedKey(userId), "0");
         }
+    }
+
+    @Override
+    public void releaseOnce(Long uploadId, Long userId, long size) {
+        if (size <= 0) {
+            return;
+        }
+        if (uploadId == null) {
+            // uploadId 还没落库的异常路径只能退化为非幂等释放；
+            // 这条路径不参与 abort/FAILED/MERGING 恢复，影响面很小。
+            release(userId, size);
+            return;
+        }
+        executeReleaseOnce("session:" + uploadId, userId, size);
+    }
+
+    @Override
+    public void refund(Long fileId, Long userId, long size) {
+        if (size <= 0) {
+            return;
+        }
+        ensureQuota(userId);
+        quotaUsageMapper.subtractUsed(userId, size);
+
+        // DB 是事实源，Redis 只是快路径；放在事务提交后扣减，避免事务回滚后提前改动 Redis。
+        runAfterCommit(() -> executeReleaseOnce("file:" + fileId, userId, size));
     }
 
     @Override
@@ -169,6 +219,43 @@ public class QuotaServiceImpl implements QuotaService {
 
     private String usedKey(Long userId) {
         return quotaProperties.getKeyPrefix() + ":used:" + userId;
+    }
+
+    private String releaseKey(String marker) {
+        return quotaProperties.getKeyPrefix() + ":released:" + marker;
+    }
+
+    private void executeReleaseOnce(String marker, Long userId, long size) {
+        try {
+            List<?> result = redisTemplate.execute(RELEASE_ONCE,
+                    List.of(usedKey(userId), releaseKey(marker)),
+                    String.valueOf(size),
+                    String.valueOf(Math.max(1, quotaProperties.getReleaseMarkerTtl().getSeconds())));
+            if (result == null || result.size() < 2) {
+                log.warn("配额幂等释放脚本返回异常：marker={}, userId={}", marker, userId);
+            }
+        } catch (Exception e) {
+            // Redis 失败不能在业务线程里吞掉：调用方会保留会话状态，交给定时任务/对账重试。
+            throw e;
+        }
+    }
+
+    private void runAfterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    try {
+                        action.run();
+                    } catch (Exception e) {
+                        // 事务已提交，这里不能再回滚；Redis 漂移交给对账任务收敛。
+                        log.warn("事务提交后的配额回退失败，等待对账修正", e);
+                    }
+                }
+            });
+            return;
+        }
+        action.run();
     }
 
     private long defaultLong(Long value) {

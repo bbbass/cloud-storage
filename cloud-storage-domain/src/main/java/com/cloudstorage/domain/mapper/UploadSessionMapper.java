@@ -7,6 +7,7 @@ import org.apache.ibatis.annotations.Param;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
+import java.time.LocalDateTime;
 import java.util.List;
 
 /**
@@ -26,10 +27,41 @@ public interface UploadSessionMapper extends BaseMapper<UploadSession> {
     @Update("UPDATE upload_sessions SET status = #{status}, update_time = NOW(3) WHERE id = #{id} AND deleted = 0")
     int updateStatus(@Param("id") Long id, @Param("status") String status);
 
-    /** 到期待回收的会话（供清理任务使用） */
-    @Select("SELECT * FROM upload_sessions WHERE status IN ('INIT', 'UPLOADING') "
-            + "AND expire_time < NOW(3) AND deleted = 0 LIMIT #{limit}")
-    List<UploadSession> selectExpired(@Param("limit") int limit);
+    /** 只允许从 MERGING 落到 FAILED，避免恢复/完成并发时覆盖已 DONE 的状态 */
+    @Update("UPDATE upload_sessions SET status = 'FAILED', update_time = NOW(3) "
+            + "WHERE id = #{id} AND status = 'MERGING' AND deleted = 0")
+    int markFailedIfMerging(@Param("id") Long id);
+
+    /**
+     * 待回收会话：过期的 INIT/UPLOADING，以及还残留分片记录的 FAILED。
+     * FAILED 只要 staging/upload_parts 清干净就不再反复捞取。
+     */
+    @Select("SELECT s.* FROM upload_sessions s WHERE s.deleted = 0 AND ("
+            + "(s.status IN ('INIT', 'UPLOADING') AND s.expire_time < NOW(3)) "
+            + "OR (s.status = 'FAILED' AND EXISTS ("
+            + "  SELECT 1 FROM upload_parts p WHERE p.upload_id = s.id AND p.deleted = 0"
+            + "))"
+            + ") ORDER BY s.update_time ASC LIMIT #{limit}")
+    List<UploadSession> selectCleanupCandidates(@Param("limit") int limit);
+
+    /** 超过阈值仍在 MERGING 的会话，交给恢复任务处理 */
+    @Select("SELECT * FROM upload_sessions WHERE status = 'MERGING' "
+            + "AND update_time < #{deadline} AND deleted = 0 "
+            + "ORDER BY update_time ASC LIMIT #{limit}")
+    List<UploadSession> selectStuckMerging(@Param("deadline") LocalDateTime deadline,
+                                           @Param("limit") int limit);
+
+    /** 恢复/登记事务内锁住会话行，避免和正常 complete 并发登记两次 */
+    @Select("SELECT * FROM upload_sessions WHERE id = #{id} AND deleted = 0 FOR UPDATE")
+    UploadSession selectByIdForUpdate(@Param("id") Long id);
+
+    /** 最终对象不存在时，把卡死的 MERGING 条件回退到 UPLOADING */
+    @Update("UPDATE upload_sessions SET status = 'UPLOADING', expire_time = #{expireTime}, "
+            + "update_time = NOW(3) WHERE id = #{id} AND status = 'MERGING' "
+            + "AND update_time < #{deadline} AND deleted = 0")
+    int resetStuckMerging(@Param("id") Long id,
+                          @Param("deadline") LocalDateTime deadline,
+                          @Param("expireTime") LocalDateTime expireTime);
 
     /** 进行中会话的预占量（配额对账用：这些字节已在 Redis 预占，但还没落到 files） */
     @Select("SELECT user_id AS userId, COALESCE(SUM(file_size), 0) AS pendingBytes FROM upload_sessions "

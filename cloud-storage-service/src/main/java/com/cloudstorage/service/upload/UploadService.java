@@ -23,4 +23,10 @@ public interface UploadService {
     void abort(Long userId, Long uploadId);
 
     UploadStatusView status(Long userId, Long uploadId);
+
+    /**
+     * 恢复超时卡死的 MERGING 会话：最终对象可用则补登记，否则回退 UPLOADING 让客户端重试。
+     * 由定时任务调用，不作为对外 HTTP 接口。
+     */
+    void recoverMerging(Long uploadId);
 }

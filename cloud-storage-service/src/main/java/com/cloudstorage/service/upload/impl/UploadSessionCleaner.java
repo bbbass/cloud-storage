@@ -14,8 +14,8 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * 过期上传会话回收：断点续传的另一面 —— 客户端再也不回来的会话必须能被清理，
- * 否则 staging 里的分片对象会一直占空间。靠 upload_sessions.expire_time 驱动。
+ * 上传会话资源回收：过期的 INIT/UPLOADING 和收尾不完整的 FAILED 都必须能被清理，
+ * 否则 staging 分片和配额预占会一直留着。
  */
 @Slf4j
 @Component
@@ -31,19 +31,24 @@ public class UploadSessionCleaner {
 
     @Scheduled(initialDelayString = "PT1M", fixedDelayString = "PT10M")
     public void cleanupExpiredSessions() {
-        List<UploadSession> expired = sessionMapper.selectExpired(BATCH_SIZE);
-        if (expired.isEmpty()) {
+        List<UploadSession> candidates = sessionMapper.selectCleanupCandidates(BATCH_SIZE);
+        if (candidates.isEmpty()) {
             return;
         }
-        for (UploadSession session : expired) {
+        for (UploadSession session : candidates) {
             try {
+                boolean failed = UploadStatus.FAILED.name().equals(session.getStatus());
+                // 先释放配额再删分片：Redis 失败时 upload_parts 还在，下一轮还能捞到并重试。
+                quotaService.releaseOnce(session.getId(), session.getUserId(), session.getFileSize());
                 partMapper.selectPartNos(session.getId())
                         .forEach(partNo -> storageService.delete(UploadServiceImpl.stagingKeyOf(session.getId(), partNo)));
                 partMapper.hardDeleteByUploadId(session.getId());
-                sessionMapper.updateStatus(session.getId(), UploadStatus.EXPIRED.name());
-                // 会话过期 = 用户放弃了这次上传，预占的配额要还回去
-                quotaService.release(session.getUserId(), session.getFileSize());
-                log.info("回收过期上传会话：uploadId={}, fileName={}", session.getId(), session.getFileName());
+                if (!failed) {
+                    // FAILED 保留状态用于排查；清完分片后它不再出现在候选查询里。
+                    sessionMapper.updateStatus(session.getId(), UploadStatus.EXPIRED.name());
+                }
+                log.info("回收上传会话：uploadId={}, status={}, fileName={}",
+                        session.getId(), session.getStatus(), session.getFileName());
             } catch (Exception e) {
                 log.warn("回收上传会话失败：uploadId={}", session.getId(), e);
             }

@@ -19,6 +19,12 @@ public interface QuotaService {
 
     void release(Long userId, long size);
 
+    /** 按 uploadId 幂等释放上传预占，重复调用不会重复扣 Redis */
+    void releaseOnce(Long uploadId, Long userId, long size);
+
+    /** 文件删除后回退已提交配额：DB 立即扣减，Redis 在事务提交后幂等扣减 */
+    void refund(Long fileId, Long userId, long size);
+
     /** 全量对账，返回处理的用户数 */
     int reconcile();
 }

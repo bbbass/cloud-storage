@@ -33,4 +33,10 @@ public class UploadProperties {
 
     /** 上传会话有效期 */
     private Duration sessionTtl = Duration.ofHours(24);
+
+    /**
+     * MERGING 超时阈值：超过这个时间仍停在 MERGING 的会话由恢复任务接管。
+     * 取 10 分钟是为了给 GB 级 compose + 回读校验留足余量，同时能兜住进程被 kill 的会话。
+     */
+    private Duration mergingTimeout = Duration.ofMinutes(10);
 }

@@ -53,6 +53,8 @@ app:
     max-chunk-total: 10000
     verify-after-merge: true
     session-ttl: 24h
+    # MERGING 超时恢复阈值：超过后由 UploadMergingRecoveryJob 接管
+    merging-timeout: 10m
   auth:
     # M1 临时身份方案（M4 换成 JWT），见 DevAuthInterceptor
     dev-default-user-id: 1
@@ -77,6 +79,8 @@ app:
     # 默认每用户 1 GiB
     default-quota-bytes: 1073741824
     key-prefix: cs:quota
+    # 配额释放幂等标记 TTL，最终一致性由对账任务兜底
+    release-marker-ttl: 7d
   mq:
     # true = 走真实 RocketMQ；false = 进程内线程池兜底（仅调试）
     enabled: true
