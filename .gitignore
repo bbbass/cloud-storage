@@ -10,7 +10,6 @@ target/
 .settings/
 .classpath
 .project
-bin/
 
 ### 前端 ###
 node_modules/
@@ -35,9 +34,6 @@ application-prod.yml
 *.jks
 id_rsa*
 id_ed25519*
-
-### 内部文档 ###
-AGENTS.md
-
 .codex/
 interview-coach/
+bin/
