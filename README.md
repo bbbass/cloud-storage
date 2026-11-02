@@ -29,7 +29,8 @@ cloud-storage/
 ├── sql/schema.sql                # 建表脚本（utf8mb4，表名全小写）
 ├── scripts/
 │   ├── dev-up.ps1                # 本地环境一键拉起与自检
-│   └── smoke-upload.ps1          # 端到端验收脚本（16 个断言环节）
+│   ├── smoke-upload.ps1          # 端到端验收脚本（16 个断言环节）
+│   └── stress/                   # 压测脚本：限流 QPS / 配额并发 / 缓存命中率 / MQ 峰值
 ├── cloud-storage-common/         # Result<T> / ErrorCode / BusinessException / RateLimitException / UserContext / 常量
 ├── cloud-storage-domain/         # 实体 + Mapper（原子 SQL 与聚合查询写在 Mapper 注解里）
 ├── cloud-storage-service/        # 业务实现：storage / upload / limiter / quota / cache / mq / processor
@@ -644,8 +645,9 @@ curl -X POST http://localhost:8080/api/v1/tasks/{taskId}/replay \
 
 ### 6.1 自动化测试
 
-- 单元测试共 20 个：`cloud-storage-service` 19 个（滑动窗口限流器、任务执行器、缩略图与 EXIF 处理器、本地存储实现、上传服务）+ `cloud-storage-web` 上下文测试 1 个，`mvn -B test` 全部通过。
+- 单元测试共 27 个：`cloud-storage-service` 26 个（滑动窗口限流器、任务执行器、缩略图与 EXIF 处理器、本地存储实现、上传服务、文件删除）+ `cloud-storage-web` 上下文测试 1 个，`mvn -B test` 全部通过。
 - 端到端脚本 `scripts/smoke-upload.ps1` 共 16 个环节，覆盖分片上传、合并幂等、秒传、断点续传、SSE 进度、配额超限、限流 429、元数据缓存、MQ 流水线、死信重放与任务统计。
+- 压测脚本 `scripts/stress/` 覆盖 4 组测量：限流、配额并发、缓存命中率、MQ 削峰；其中限流同时给出「判断吞吐」与「端到端 QPS」两个口径。
 
 ### 6.2 实测结果
 
@@ -664,6 +666,37 @@ curl -X POST http://localhost:8080/api/v1/tasks/{taskId}/replay \
 | 异步处理 | 上传 1 张 JPEG 后自动产生 THUMBNAIL 与 EXIF 两条任务并执行完成；缩略图 `thumbnails/{前缀}/{sha256}_256.jpg`（1762 字节）写入 MinIO |
 | 死信与重放 | 损坏图片重试耗尽后进入 `DEAD`（`errorMsg=生成缩略图失败：No suitable ImageReader found`），调用重放接口后恢复为 `PENDING` |
 | 消息积压 | 10 条消息、8 个队列，消费位点与 broker 位点差值全部为 0 |
+| 限流判断吞吐 | redis-benchmark 直压滑动窗口 Lua（单 Redis、db1、50 客户端、10 万次）：放行路径 **19,868 ops/s**，混合放行/拒绝 21,142 ops/s，同机纯 `ZADD` 对照 16,846 ops/s |
+| 限流端到端吞吐 | `GET /api/v1/files/{fileId}`（缓存命中、64 连接、15 s、阈值抬高）：**1165 QPS**，p50 55.9 ms / p99 140 ms，0 个 429；关闭限流同条件 1002 QPS，差异在噪声内 |
+| 配额并发超卖 | 100 并发 init / 10 MiB 配额 / 每文件 1 MiB：受理 10、拒绝 90（`50002`），预占 10,485,760 字节 = 配额，**超卖 0**；abort 后归零 |
+| 缓存命中率 | 预热 1 次后 2000 次读：hits 2000 / misses 1 = **99.95%**，rebuilds 1、fallbackReads 0 |
+| MQ 生产峰值 | 注入 3000 条任务消息：**1474 msg/s**（96 线程；此刻上限来自 broker 的 `sendMessageThreadPoolNums=4`） |
+| MQ 削峰与追平 | 积压峰值 3000，消费峰值 72 tasks/s、平均 38.6 tasks/s，**77.8 s 追平**；broker `Consume Diff` 1766 → 0，3000 条任务全部 DONE |
+| 批量任务可靠性 | 本轮 3000 条任务最终全部 DONE（失败 0）；重试与死信重放路径由冒烟步骤 15 覆盖 |
+
+压测环境说明：单机 Windows 11 + WSL2，MySQL 在 Windows 侧，Redis / MinIO / RocketMQ 在 WSL 里，后端单实例（JDK 17）。RocketMQ broker 为 `ASYNC_MASTER` + `ASYNC_FLUSH`、默认 `sendMessageThreadPoolNums=4`，这是发送峰值的主要上限；Redis 是共享实例（db0 属别的项目），压测只用本项目 key 前缀与 db1。QPS 类数字在「抬高 `app.limiter.scenes.*` 阈值」下测得，避免中途被 429 截断；限流本身的代价用「关闭限流同条件对照」给出。
+
+### 6.3 压测脚本
+
+```powershell
+# 后端需已启动；MQ 项依赖一个可解码的图片对象，先跑一次 smoke-upload.ps1
+powershell -ExecutionPolicy Bypass -File scripts\stress\run-stress.ps1
+powershell -ExecutionPolicy Bypass -File scripts\stress\run-stress.ps1 -SkipMq
+```
+
+| 脚本 | 测什么 | 关键参数 |
+|---|---|---|
+| `scripts/stress/limiter-qps.mjs` | 限流路径端到端 QPS 与延迟分位（`GET /files/{id}`） | `--connections` `--duration` `--label` |
+| `scripts/stress/quota-concurrency.mjs` | 并发预占是否超卖，并交叉核对 `/quota` | `--concurrency` `--quota-bytes` `--file-bytes` |
+| `scripts/stress/cache-hitrate.mjs` | 元数据缓存命中率（取 `/health` 计数器的增量） | `--requests` `--concurrency` |
+| `scripts/stress/mq-peak.mjs` | 生产峰值、积压曲线、消费速率与追平耗时 | `--tasks` `--threads` `--interval-ms` |
+| `scripts/stress/MqBurstProducer.java` | 用同一 `rocketmq-client` 注入任务消息（由 `mq-peak.mjs` 调用） | `--ids` `--threads` |
+
+两个实现细节：MQ 项用一次性用户灌入 N 个文件条目 + 2N 条 PENDING 任务（即一次真实上传会产生的行），再用独立生产者按同一 topic 注入消息，消费链路（DB → MinIO → handler）与生产一致；种子行的 `next_retry_time` 推到一天后，避免补偿任务在测量窗口内重复投递。脚本结束时默认清理灌入的行，`--keep true` 可保留现场。
+
+配额与 MQ 两项需要直连 MySQL 灌测试数据（脚本默认口令 `123456`，可用 `CS_MYSQL_PASSWORD` 环境变量或 `-MysqlPassword` 覆盖）；MQ 项首次运行会从 `cloud-storage-web/target/cloud-storage-web.jar` 抽取依赖到 `target/stress-libs`，因此需要先打包。
+
+---
 
 ---
 

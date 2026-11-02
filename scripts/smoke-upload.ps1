@@ -65,12 +65,20 @@ function Send-Part([long]$uploadId, [int]$partNo, [string]$partFile,
     return $response.data
 }
 
-function New-TestJpeg([string]$path, [int]$width, [int]$height) {
+function New-TestJpeg([string]$path, [int]$width, [int]$height, [int]$seed) {
+    # The bytes must differ on every run: a fixed JPEG is already in file_objects
+    # after the first run, so init would answer instantUpload and steps 14/15 break.
     Add-Type -AssemblyName System.Drawing
     $bitmap = New-Object System.Drawing.Bitmap($width, $height)
     $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-    $graphics.Clear([System.Drawing.Color]::CornflowerBlue)
+    $rnd = New-Object System.Random $seed
+    $graphics.Clear([System.Drawing.Color]::FromArgb($rnd.Next(256), $rnd.Next(256), $rnd.Next(256)))
     $graphics.FillEllipse([System.Drawing.Brushes]::Orange, 20, 20, 120, 90)
+    for ($i = 0; $i -lt 64; $i++) {
+        $brush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb($rnd.Next(256), $rnd.Next(256), $rnd.Next(256)))
+        $graphics.FillRectangle($brush, $rnd.Next($width), $rnd.Next($height), 12, 12)
+        $brush.Dispose()
+    }
     $graphics.Dispose()
     $bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
     $bitmap.Dispose()
@@ -293,7 +301,7 @@ Assert-True ($cache.rebuilds -ge 1) "cache recorded at least one rebuild (mutual
 
 Write-Step "14) MQ pipeline: upload a real JPEG, expect THUMBNAIL + EXIF tasks to finish"
 $jpegPath = Join-Path $workDir 'photo.jpg'
-$jpegSha = New-TestJpeg $jpegPath 640 480
+$jpegSha = New-TestJpeg $jpegPath 640 480 $Seed
 $jpegSize = (Get-Item -LiteralPath $jpegPath).Length
 $initImg = Invoke-Init 'photo.jpg' $jpegSize $jpegSha $ChunkSize 'image/jpeg'
 Send-FileChunked ([long]$initImg.uploadId) $jpegPath $ChunkSize 'image/jpeg'
@@ -310,7 +318,7 @@ Assert-True ($exif.status -eq 'DONE') "EXIF task DONE, result=$($exif.result)"
 Write-Step "15) dead letter: corrupt JPEG exhausts retries -> DEAD -> replay via API"
 $badPath = Join-Path $workDir 'broken.jpg'
 $badBytes = New-Object byte[] 4096
-(New-Object System.Random 99).NextBytes($badBytes)
+(New-Object System.Random ($Seed + 7)).NextBytes($badBytes)
 [System.IO.File]::WriteAllBytes($badPath, $badBytes)
 $badSha = (Get-FileHash -LiteralPath $badPath -Algorithm SHA256).Hash.ToLower()
 $badSize = (Get-Item -LiteralPath $badPath).Length
